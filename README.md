@@ -137,6 +137,21 @@ exchange. The first step happens in the calling service, not here:
 3. The plugin redeems the ID-JAG at the **target** authorization server for the access
    token that goes upstream, carrying the nested `act` chain.
 
+The plugin is indifferent to which of two Okta connection types sits underneath, because
+steps two and three are the same request either way. What differs is what the agent is
+reaching:
+
+| Target | Okta connection type | Shape |
+|---|---|---|
+| An API behind a custom authorization server | `IDENTITY_ASSERTION_CUSTOM_AS` | carries a `resourceIndicator` |
+| Another registered agent | `IDENTITY_ASSERTION_A2A_SERVER` | carries a `resource` (name + orn) and its `authorizationServer`, and has **no** `resourceIndicator` |
+
+Worth knowing when you copy an existing connection as a template: those two shapes are
+not interchangeable, and the agent-to-agent one additionally requires the target agent to
+be registered as an A2A server and a **delegation link** from the caller to the agent. The
+delegation link's `tokenType` is what selects machine context (`ACCESS_TOKEN`) from human
+context (`ID_TOKEN`), and it is easy to miss entirely because nothing else hints at it.
+
 Four things that otherwise cost real debugging time:
 
 - **`aud` comes from `resource`, not from the authorization server's `audiences`
