@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -34,9 +35,21 @@ type Client struct {
 // NewClient builds a Client from the plugin config. The private key is parsed once,
 // at construction, so a malformed key fails at startup rather than on first use.
 func NewClient(cfg Config) (*Client, error) {
-	key, kid, err := parseRSAPrivateJWK(cfg.PrivateKeyJWK)
+	raw := cfg.PrivateKeyJWK
+	source := "private_key_jwk"
+
+	if f := strings.TrimSpace(cfg.PrivateKeyJWKFile); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, fmt.Errorf("okta plugin: private_key_jwk_file %q: %w", f, err)
+		}
+		raw = string(b)
+		source = "private_key_jwk_file " + f
+	}
+
+	key, kid, err := parseRSAPrivateJWK(raw)
 	if err != nil {
-		return nil, fmt.Errorf("okta plugin: private_key_jwk: %w", err)
+		return nil, fmt.Errorf("okta plugin: %s: %w", source, err)
 	}
 	return &Client{
 		domain:  strings.TrimSuffix(cfg.OktaDomain, "/"),

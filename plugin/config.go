@@ -29,9 +29,23 @@ type Config struct {
 	// not to mint anything.
 	AgentResourceURL string `json:"agent_resource_url"`
 
-	// PrivateKeyJWK is the agent's private key in JWK form, used to build the
-	// client assertion. Secret. Redacted from API responses via RedactConfig.
-	PrivateKeyJWK string `json:"private_key_jwk"`
+	// PrivateKeyJWK is the agent's private key in JWK form, used to build the client
+	// assertion. Secret.
+	//
+	// Prefer PrivateKeyJWKFile. Putting a JWK inline means the key ends up in the
+	// gateway's config, which then has to be treated as a secret everywhere it is
+	// stored, rendered, or backed up. It also has to survive JSON escaping and, in
+	// practice, whatever shell renders the config, which is a reliable source of
+	// corrupted keys.
+	PrivateKeyJWK string `json:"private_key_jwk,omitempty"`
+
+	// PrivateKeyJWKFile is a path to a file containing the agent's private key as a
+	// JWK. Read once, at startup.
+	//
+	// This is the recommended form: the config stays non-secret, the key lives in
+	// exactly one place with its own file permissions, and nothing has to escape it.
+	// Exactly one of PrivateKeyJWK or PrivateKeyJWKFile must be set.
+	PrivateKeyJWKFile string `json:"private_key_jwk_file,omitempty"`
 
 	// Bindings maps a Bifrost MCP client name to the Okta authorization server that
 	// protects it. One entry per upstream MCP server. Splitting read and command
@@ -102,8 +116,13 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.AgentID) == "" {
 		problems = append(problems, "agent_id is required")
 	}
-	if strings.TrimSpace(c.PrivateKeyJWK) == "" {
-		problems = append(problems, "private_key_jwk is required")
+	inline := strings.TrimSpace(c.PrivateKeyJWK) != ""
+	fromFile := strings.TrimSpace(c.PrivateKeyJWKFile) != ""
+	switch {
+	case inline && fromFile:
+		problems = append(problems, "set only one of private_key_jwk or private_key_jwk_file, not both")
+	case !inline && !fromFile:
+		problems = append(problems, "one of private_key_jwk or private_key_jwk_file is required")
 	}
 	if strings.TrimSpace(c.AgentResourceURL) == "" {
 		problems = append(problems, "agent_resource_url is required (the agent's dual-citizenship resource URL)")

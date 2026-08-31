@@ -10,8 +10,15 @@
 # Nothing here needs a local Go install.
 
 GO_IMAGE     ?= golang:1.27
-BIFROST_CORE ?= v1.8.4
 PLUGIN_NAME  ?= okta-agent-identity
+
+# BIFROST_CORE must equal the core version the target Bifrost binary was built with,
+# not merely a compatible-looking one. Go plugin loading compares every shared
+# dependency, so core v1.8.4 against a v1.8.3 host fails to load.
+#
+# Do not guess this. Run `make compat` and it will tell you.
+BIFROST_CORE  ?= v1.8.3
+BIFROST_IMAGE ?= maximhq/bifrost:latest
 
 # A .so must match the host's ARCHITECTURE as well as its Go version. Docker on Apple
 # Silicon defaults to arm64, which will not load into an amd64 Bifrost. Set PLATFORM to
@@ -68,6 +75,22 @@ fmt-check: ## Fail if anything is unformatted
 .PHONY: tidy
 tidy: ## Reconcile go.mod / go.sum
 	$(RUN) go mod tidy
+
+.PHONY: compat
+compat: ## Report which bifrost/core version $(BIFROST_IMAGE) requires
+	@echo "inspecting $(BIFROST_IMAGE) ..."
+	@cid=$$(docker create $(BIFROST_IMAGE)) ; \
+	tmp=$$(mktemp -d) ; \
+	docker cp "$$cid:/app/main" "$$tmp/main" >/dev/null 2>&1 || { \
+		echo "could not find /app/main in the image; adjust the path in this target" >&2 ; \
+		docker rm -f "$$cid" >/dev/null ; exit 1 ; } ; \
+	docker rm -f "$$cid" >/dev/null ; \
+	$(DOCKER) run --rm --platform $(PLATFORM) -v "$$tmp":/x $(GO_IMAGE) \
+		sh -c 'echo "  go:   $$(go version -m /x/main | head -1 | awk "{print \$$2}")"; \
+		       echo "  core: $$(go version -m /x/main | grep "bifrost/core" | awk "{print \$$3}")"' ; \
+	rm -rf "$$tmp" ; \
+	echo ; \
+	echo "Set BIFROST_CORE to the core version above, then: make pin && make plugin"
 
 .PHONY: pin
 pin: ## Re-pin bifrost/core to $(BIFROST_CORE)
