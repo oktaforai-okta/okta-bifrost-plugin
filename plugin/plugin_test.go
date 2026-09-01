@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -454,5 +456,161 @@ func TestSubjectTokenErrorNeverContainsTheToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatal("the error message contains the credential")
+	}
+}
+
+// --- Exchange's partial-result contract ---
+//
+// When redemption fails, Exchange returns the assertion alongside the error. That is the
+// case where seeing it matters most: it distinguishes "Okta would not assert this
+// delegation" from "Okta asserted it and the target refused to honour it". These are
+// different problems, and a caller that cannot tell them apart misdirects whoever is
+// debugging.
+
+// newTestClient points a Client at a TLS test server, which works because endpoints are
+// built from the domain and the server's own client trusts its certificate.
+func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.Server) {
+	t.Helper()
+
+	srv := httptest.NewTLSServer(handler)
+	t.Cleanup(srv.Close)
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	return &Client{
+		domain:  strings.TrimPrefix(srv.URL, "https://"),
+		agentID: "wlpTESTAGENT",
+		key:     key,
+		keyID:   "test-kid",
+		http:    srv.Client(),
+	}, srv
+}
+
+func TestExchangeReturnsTheAssertionWhenRedemptionFails(t *testing.T) {
+	const assertion = "eyJhbGciOiJSUzI1NiJ9.aXQtaXMtYW4tYXNzZXJ0aW9u.sig"
+
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/oauth2/v1/token") {
+			// Org authorization server: hand back an ID-JAG.
+			_, _ = w.Write([]byte(`{"access_token":"` + assertion + `","token_type":"N_A","expires_in":300}`))
+			return
+		}
+		// Target authorization server: refuse to honour it.
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_scope","error_description":"The following scopes are not allowed for this request: [task.dispatch]."}`))
+	})
+
+	res, err := c.Exchange("caller-subject-token", Binding{
+		AuthorizationServerID: "ausTARGET",
+		TargetResourceURL:     "api://sentinel-tasking",
+		Scopes:                []string{"task.dispatch"},
+	})
+
+	if err == nil {
+		t.Fatal("expected redemption to fail")
+	}
+	if res == nil {
+		t.Fatal("expected a partial result carrying the assertion, got nil")
+	}
+	if res.IDJAG != assertion {
+		t.Errorf("IDJAG = %q, want the assertion that was actually obtained", res.IDJAG)
+	}
+	if res.AccessToken != "" {
+		t.Errorf("AccessToken = %q, want empty: nothing was issued", res.AccessToken)
+	}
+	// The refusal must still name the scope, or a caller cannot tell why.
+	if !strings.Contains(err.Error(), "task.dispatch") {
+		t.Errorf("error lost Okta's wording: %v", err)
+	}
+	// And it must be attributable to redemption rather than to the exchange.
+	if !strings.Contains(err.Error(), "redemption") {
+		t.Errorf("error should identify which call failed: %v", err)
+	}
+}
+
+func TestExchangeReturnsNoResultWhenTheAssertionItselfFails(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid_client","error_description":"kid is invalid"}`))
+	})
+
+	res, err := c.Exchange("caller-subject-token", Binding{
+		AuthorizationServerID: "ausTARGET",
+		TargetResourceURL:     "api://sentinel-tasking",
+		Scopes:                []string{"task.read"},
+	})
+
+	if err == nil {
+		t.Fatal("expected the exchange to fail")
+	}
+	// Nothing was asserted, so there is nothing partial to hand back.
+	if res != nil {
+		t.Errorf("expected nil result when nothing was asserted, got %+v", res)
+	}
+	if !strings.Contains(err.Error(), "exchange") {
+		t.Errorf("error should identify which call failed: %v", err)
+	}
+}
+
+// MintResourceToken must not be fooled by a non-nil partial result.
+func TestMintResourceTokenIgnoresPartialResults(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/oauth2/v1/token") {
+			_, _ = w.Write([]byte(`{"access_token":"assertion.value.here","expires_in":300}`))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"access_denied","error_description":"Policy evaluation failed for this request."}`))
+	})
+
+	tok, expiry, err := c.MintResourceToken("caller-subject-token", Binding{
+		AuthorizationServerID: "ausTARGET",
+		TargetResourceURL:     "api://sentinel-tasking",
+		Scopes:                []string{"task.dispatch"},
+	})
+
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if tok != "" {
+		t.Errorf("token = %q, want empty on failure", tok)
+	}
+	if !expiry.IsZero() {
+		t.Errorf("expiry = %v, want zero on failure", expiry)
+	}
+}
+
+func TestExchangeSucceedsAndReturnsBothArtifacts(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/oauth2/v1/token") {
+			_, _ = w.Write([]byte(`{"access_token":"the.id.jag","token_type":"N_A","expires_in":300}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"access_token":"the.access.token","token_type":"Bearer","expires_in":3600}`))
+	})
+
+	res, err := c.Exchange("caller-subject-token", Binding{
+		AuthorizationServerID: "ausTARGET",
+		TargetResourceURL:     "api://sentinel-tasking",
+		Scopes:                []string{"task.read"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.IDJAG != "the.id.jag" {
+		t.Errorf("IDJAG = %q", res.IDJAG)
+	}
+	if res.AccessToken != "the.access.token" {
+		t.Errorf("AccessToken = %q", res.AccessToken)
+	}
+	if time.Until(res.ExpiresAt) < 50*time.Minute {
+		t.Errorf("ExpiresAt = %v, expected roughly an hour out from expires_in 3600", res.ExpiresAt)
 	}
 }

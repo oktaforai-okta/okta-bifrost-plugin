@@ -105,15 +105,28 @@ type ExchangeResult struct {
 
 // Exchange runs the two agent-side steps and returns both artifacts.
 // See the OktaClient interface for why step one happens elsewhere.
+//
+// PARTIAL RESULT ON ERROR: when the assertion is obtained but redemption fails, this
+// returns a non-nil result carrying only IDJAG, alongside the error. That is deliberate.
+// Redemption failing is the case where seeing the assertion matters most, because it is
+// the difference between "Okta would not assert this delegation" and "Okta asserted it and
+// the target authorization server refused to honour it", which are different problems with
+// different fixes. Discarding it forces a caller to infer that the exchange succeeded
+// rather than show what was actually asserted.
+//
+// So: on a non-nil error, the result may be nil or partial. Check the error first, and
+// treat AccessToken as present only when err is nil. Never treat a non-nil result as
+// success.
 func (c *Client) Exchange(subjectToken string, b Binding) (*ExchangeResult, error) {
 	idJAG, err := c.exchangeForIDJAG(subjectToken, b)
 	if err != nil {
+		// Nothing was asserted, so there is no partial result to hand back.
 		return nil, err
 	}
 
 	token, expiresIn, err := c.redeemIDJAG(idJAG, b)
 	if err != nil {
-		return nil, err
+		return &ExchangeResult{IDJAG: idJAG}, err
 	}
 
 	return &ExchangeResult{
