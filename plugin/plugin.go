@@ -59,7 +59,9 @@ type OktaClient interface {
 	//  2. Exchange that token at the ORG authorization server for an ID-JAG, with the
 	//     target's authorization server as audience and the target's resource URL as
 	//     resource. Both are required; audience selects the server, resource selects
-	//     what within it is addressed, and resource is what Okta stamps into aud.
+	//     what within it is addressed. The issued token is observed to carry an aud
+	//     equal to the resource value, though what determines aud is an open question:
+	//     see the note on exchangeForIDJAG in okta.go before relying on the mechanism.
 	//
 	//  3. Redeem the ID-JAG at the TARGET authorization server for the final access
 	//     token, which carries the nested act chain.
