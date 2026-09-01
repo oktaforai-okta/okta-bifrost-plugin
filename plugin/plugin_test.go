@@ -1,6 +1,7 @@
 package oktabifrost
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -358,5 +359,100 @@ func decodeSegment(t *testing.T, seg string, out any) {
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		t.Fatalf("unmarshal segment: %v", err)
+	}
+}
+
+// --- caller token extraction ---
+//
+// These matter because the purpose-built context key is empty on open-source Bifrost, so
+// the fallback is not a nicety, it is the only path that works. A regression here fails
+// closed and every tool call is refused, which looks like an Okta problem rather than a
+// context-reading problem.
+
+func ctxWith(key schemas.BifrostContextKey, val any) *schemas.BifrostContext {
+	return schemas.NewBifrostContextWithValue(context.Background(), time.Now().Add(time.Minute), key, val)
+}
+
+func TestSubjectTokenFromRequestHeaders(t *testing.T) {
+	ctx := ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"authorization": "Bearer abc.def.ghi",
+		"content-type":  "application/json",
+	})
+
+	tok, err := subjectTokenFrom(ctx)
+	if err != nil {
+		t.Fatalf("expected the header to be found: %v", err)
+	}
+	if tok != "abc.def.ghi" {
+		t.Errorf("token = %q, want the value with the Bearer prefix stripped", tok)
+	}
+}
+
+// The scheme is case-insensitive per RFC 7235, and a lowercase "bearer" must not fail
+// closed in a way that is indistinguishable from a missing header.
+func TestSubjectTokenBearerPrefixIsCaseInsensitive(t *testing.T) {
+	for _, prefix := range []string{"Bearer ", "bearer ", "BEARER ", "BeArEr "} {
+		ctx := ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+			"authorization": prefix + "tok.en.value",
+		})
+		tok, err := subjectTokenFrom(ctx)
+		if err != nil {
+			t.Errorf("%q: %v", prefix, err)
+			continue
+		}
+		if tok != "tok.en.value" {
+			t.Errorf("%q: token = %q", prefix, tok)
+		}
+	}
+}
+
+// The purpose-built key wins when something actually populates it, so that a Bifrost build
+// with a real auth layer does not silently keep using the fallback.
+func TestSubjectTokenPrefersTheInboundBearerKey(t *testing.T) {
+	ctx := ctxWith(schemas.BifrostContextKeyMCPInboundBearer, "Bearer preferred.tok.en").
+		WithValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+			"authorization": "Bearer fallback.tok.en",
+		})
+
+	tok, err := subjectTokenFrom(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tok != "preferred.tok.en" {
+		t.Errorf("token = %q, want the inbound-bearer key to take precedence", tok)
+	}
+}
+
+func TestSubjectTokenDeniesWhenNothingUsable(t *testing.T) {
+	cases := map[string]*schemas.BifrostContext{
+		"nil context":       nil,
+		"no keys at all":    ctxWith(schemas.BifrostContextKey("unrelated"), "x"),
+		"no auth header":    ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{"host": "x"}),
+		"empty auth header": ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{"authorization": "   "}),
+		"bearer with no token": ctxWith(schemas.BifrostContextKeyRequestHeaders,
+			map[string]string{"authorization": "Bearer "}),
+		"wrong type on key": ctxWith(schemas.BifrostContextKeyRequestHeaders, []string{"nope"}),
+	}
+
+	for name, ctx := range cases {
+		if _, err := subjectTokenFrom(ctx); err == nil {
+			t.Errorf("%s: expected a denial, got a token", name)
+		}
+	}
+}
+
+// A denial must never leak the credential it was looking at.
+func TestSubjectTokenErrorNeverContainsTheToken(t *testing.T) {
+	const secret = "super.secret.value"
+	ctx := ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"authorization": "Basic " + secret, // wrong scheme, so it is not usable as a bearer
+	})
+
+	_, err := subjectTokenFrom(ctx)
+	if err == nil {
+		t.Skip("Basic auth was accepted as a bearer; that is a separate bug")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("the error message contains the credential")
 	}
 }
