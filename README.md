@@ -216,7 +216,7 @@ Add an entry to Bifrost's plugin configuration pointing `path` at the built `.so
     "agent_id": "wlp...",
     "agent_resource_url": "https://your-app.example/agent",
     "private_key_jwk_file": "/secrets/agent-key.jwk",
-    "agent_status_ttl": "1ms",
+    "agent_status_ttl": "10s",
     "fail_open": false,
     "allow_connect_without_caller": true,
     "bindings": {
@@ -243,7 +243,7 @@ Add an entry to Bifrost's plugin configuration pointing `path` at the built `.so
 | `private_key_jwk_file` | one of | Path to the agent's private key as a JWK. **Prefer this** |
 | `private_key_jwk` | one of | The JWK inline. Puts key material in the gateway config, which then has to be treated as a secret everywhere it is stored, rendered, or backed up |
 | `bindings` | yes | One entry per Bifrost MCP client. Keyed by client name |
-| `agent_status_ttl` | no | Staleness bound on revocation. Default `10s`. **Ship `1ms`.** See [Known defect: the verdict cache](#known-defect-the-verdict-cache) before raising it |
+| `agent_status_ttl` | no | Cache lifetime for Okta's answer, and therefore the revocation staleness bound. Default and shipped value `10s`. See [the verdict cache](#the-verdict-cache-and-what-agent_status_ttl-really-controls) before changing it |
 | `fail_open` | no | Default `false`, and should stay false |
 | `allow_connect_without_caller` | no | Default `false`. **You almost certainly need `true`.** See below |
 
@@ -502,7 +502,7 @@ distinguishes cases that look identical from the outside.
 | `'subject_token' is invalid` | The caller presented an ID token, or a token from the **org** authorization server. It must be an access token from a **custom** authorization server with a resource-scoped `aud` |
 | `invalid_client` | The agent's `private_key_jwt` does not match the key registered on the agent |
 | The upstream rejects a token the plugin clearly minted | Not a denial. `auth_type` is not `none`, so Bifrost overwrote the plugin's `Authorization` header |
-| A refusal naming a scope the call never requested | Not a denial. The verdict-cache defect. Confirm `agent_status_ttl` is `1ms` |
+| A refusal naming a scope the call never requested | Not a denial. This was a verdict-cache key collision, fixed by `Binding.verdictKey()`. If you see it, you are on a build predating that fix |
 
 For demonstrating least privilege, ask a disallowed **scope** over a connection the agent
 legitimately holds. That produces the first row, which is unambiguous. Pointing at a resource
@@ -531,28 +531,58 @@ fixes. On a non-nil error the result may be nil or partial: check the error firs
 `MintResourceToken` is the narrow wrapper the hooks use, since they only ever need the token
 that goes upstream.
 
-## Known defect: the verdict cache
+## The verdict cache, and what `agent_status_ttl` really controls
 
-**Read this before raising `agent_status_ttl`.**
+The plugin caches Okta's answer so that repeated identical questions do not each cost a round
+trip. `agent_status_ttl` bounds how long an answer is reused. It ships at `10s`, which is also
+the plugin default.
 
-The verdict cache has an **unresolved bug**. A cached denial could be served to a *different*
-binding on the same authorization server, producing a refusal that names a scope the second
-call never requested. A read call gets refused for a command scope it never asked for, and the
-error message actively misleads whoever is debugging it.
+### A fixed bug worth knowing about
 
-**The mitigation in the shipped configuration is `agent_status_ttl: "1ms"`.** At that value
-the cache never serves a stale answer, so every tool call re-asks Okta.
+The cache key was originally the authorization server id alone. Two bindings on **one**
+authorization server therefore shared a verdict, so a denial recorded for one was reported for
+the other, citing a scope the second call never requested. That is a misleading error rather
+than an unsafe one, and it is exactly the shape this demo would hit, since both its bindings
+sit on the same authorization server.
 
-Be clear about what that means:
+**Fixed at the root.** `Binding.verdictKey()` in `plugin/config.go` now keys on the
+authorization server id, the target resource URL, and the **sorted** scope set, NUL-joined.
+Sorting means the same set in a different order shares an answer; NUL means no combination of
+values can be concatenated into a collision, because it cannot occur in an Okta id, a URL, or
+an OAuth scope token.
 
-- The current configuration is correct **because the cache is effectively disabled**, not
-  because the caching path has been proven right.
-- **Raising the TTL re-introduces the risk** until the root cause is found and fixed.
-- The cost of the mitigation is **one Okta round trip per tool call**. That is the current
-  performance characteristic. It is a deliberate trade, not an oversight.
+Two tests cover it in both directions, and both were **mutation-tested**: reverting the key
+makes them fail, so they actually bite.
 
-If you are here because per-call latency matters, the fix is to resolve the caching bug, not
-to raise the TTL.
+| Test | Asserts |
+|---|---|
+| `TestVerdictIsNotSharedAcrossBindingsOnOneAuthorizationServer` | two bindings on one server do not share a verdict |
+| `TestVerdictKeyIgnoresScopeOrderButNotScopeContent` | scope **order** shares an answer, scope **content** does not |
+
+The caching path is verified at the live `10s` TTL, not only with caching disabled. An
+interleaved six-call sequence across both bindings is order-independent and correct every
+time.
+
+### The honest caveat on `10s`
+
+`10s` is a **demo default, not a tuned production value**, and the number is doing two jobs at
+once. It is the cache lifetime, and it is therefore also the **revocation staleness bound**.
+
+**Raising it widens the window in which a deactivated agent still passes.** That is the real
+tradeoff, and it is not a free performance dial. Choose it against how quickly your
+environment needs a deactivation to bite, not against latency alone.
+
+### What actually costs a round trip
+
+Worth separating, because it is easy to attribute the wrong cost to the wrong mechanism.
+
+| | Frequency | Why |
+|---|---|---|
+| The **authorization check** | at most once per `10s` per distinct question | cached, keyed on the exact binding |
+| The **mint** | two token requests per call | Bifrost connections are per-call, so the connect-time mint runs per call. Nothing to do with the TTL |
+
+So the per-call cost is driven by Bifrost's per-call connection model, not by the cache
+setting. Lowering the TTL does not add the minting cost, and raising it does not remove it.
 
 ## Known limitations
 
@@ -560,9 +590,10 @@ to raise the TTL.
   carries the scopes granted then. Tightening a connection's scope list takes effect on the
   next connection, not the next call. Closing that needs the connection re-established, which
   no MCP hook can do.
-- **It does not receive revocation signals.** Revocation is detected by asking. With the TTL
-  at `1ms` that is every call. `Plugin.InvalidateVerdicts()` is the seam for an Okta event hook
-  or a shared-signals receiver. Nothing calls it yet.
+- **It does not receive revocation signals.** Revocation is detected by asking, within
+  `agent_status_ttl`, so at the shipped `10s` a deactivation can take up to ten seconds to
+  bite. `Plugin.InvalidateVerdicts()` is the seam for an Okta event hook or a shared-signals
+  receiver, which would close that window. Nothing calls it yet.
 - **It does not do per-object authorization.** A scope can say an agent may dispatch. It
   cannot say whether the agent may dispatch *this particular* vehicle. That belongs in a
   fine-grained authorization layer above this one.

@@ -153,7 +153,7 @@ func (c *Client) MintResourceToken(subjectToken string, b Binding) (string, time
 // audience selects which authorization server should honour the assertion, and must be
 // the server's ISSUER url (https://domain/oauth2/{asId}), not its token endpoint.
 //
-// CONTESTED: whether `resource` belongs on this request at all.
+// PARTLY SETTLED: whether `resource` belongs on this request at all.
 //
 // Okta's published docs mention `resource` exactly once, on the client_credentials call
 // that produces the caller's token, and omit it from every documented parameter table
@@ -162,14 +162,28 @@ func (c *Client) MintResourceToken(subjectToken string, b Binding) (string, time
 //
 // Against that: a live, working implementation in a sibling tenant sends `resource`
 // here, and its issued tokens carried an aud matching the resource url rather than the
-// authorization server's configured audiences value. So either the docs are incomplete
-// for the agent-to-agent path, or something else explains that aud.
+// authorization server's configured audiences value.
 //
-// It is sent here because removing a parameter that a verified-working implementation
-// includes, on the strength of documentation alone, is the worse risk. An unrecognised
-// parameter is normally ignored. Settle this by decoding a real token and comparing aud
-// against both candidate sources, then delete this comment and the parameter, or delete
-// this comment and keep it.
+// WHAT IS NOW OBSERVED, from decoding real tokens issued through this code:
+// the access token's aud is exactly the `resource` value sent here. Verified repeatedly
+// against this tenant.
+//
+// WHY THAT DOES NOT YET SETTLE IT, which is the trap to avoid: the two bindings in the
+// reference demo share ONE authorization server, so if that server's configured
+// audiences happens to hold the same string, both candidate sources predict the same
+// aud and the observation cannot distinguish them. Matching aud is therefore consistent
+// with `resource` being authoritative, but is not proof of it.
+//
+// TO ACTUALLY SETTLE IT, do one of:
+//   - read the target authorization server's configured `audiences` and check whether it
+//     differs from the resource url. If it differs and aud still matches resource, then
+//     resource is authoritative and this comment can go.
+//   - or send a resource url that the server's audiences value does NOT contain, on a
+//     connection that permits it, and see which one aud follows.
+//
+// Until then the parameter stays. Removing a parameter that a verified-working
+// implementation includes, on the strength of documentation alone, is the worse risk,
+// and an unrecognised parameter is normally ignored.
 func (c *Client) exchangeForIDJAG(subjectToken string, b Binding) (string, error) {
 	assertion, err := c.clientAssertion(c.orgTokenEndpoint())
 	if err != nil {
