@@ -81,20 +81,57 @@ func (c *Client) casIssuer(authorizationServerID string) string {
 	return fmt.Sprintf("https://%s/oauth2/%s", c.domain, authorizationServerID)
 }
 
-// MintResourceToken runs the two agent-side steps of the machine-context exchange.
+// ExchangeResult carries both artifacts the exchange produces, not just the one that
+// goes on the wire.
+//
+// The ID-JAG matters to anyone trying to understand or debug a delegation: it is the
+// assertion that actually asserts the delegation, and the access token is only what that
+// assertion was redeemed for. Discarding it means a failure at redemption cannot be told
+// apart from a failure at exchange by inspection, and an operator has no way to see what
+// was asserted on their behalf.
+//
+// Both fields are live credentials. Do not log them.
+type ExchangeResult struct {
+	// IDJAG is the short-lived, single-use assertion from the org authorization server.
+	IDJAG string
+
+	// AccessToken is what the target authorization server issued for it, and the only
+	// one of the two that is sent upstream.
+	AccessToken string
+
+	// ExpiresAt applies to AccessToken.
+	ExpiresAt time.Time
+}
+
+// Exchange runs the two agent-side steps and returns both artifacts.
 // See the OktaClient interface for why step one happens elsewhere.
-func (c *Client) MintResourceToken(subjectToken string, b Binding) (string, time.Time, error) {
+func (c *Client) Exchange(subjectToken string, b Binding) (*ExchangeResult, error) {
 	idJAG, err := c.exchangeForIDJAG(subjectToken, b)
 	if err != nil {
-		return "", time.Time{}, err
+		return nil, err
 	}
 
 	token, expiresIn, err := c.redeemIDJAG(idJAG, b)
 	if err != nil {
-		return "", time.Time{}, err
+		return nil, err
 	}
 
-	return token, time.Now().Add(time.Duration(expiresIn) * time.Second), nil
+	return &ExchangeResult{
+		IDJAG:       idJAG,
+		AccessToken: token,
+		ExpiresAt:   time.Now().Add(time.Duration(expiresIn) * time.Second),
+	}, nil
+}
+
+// MintResourceToken satisfies OktaClient. It is the narrow form the hooks use, which only
+// ever needs the token that goes upstream. Callers that want to show or inspect the
+// delegation should use Exchange instead.
+func (c *Client) MintResourceToken(subjectToken string, b Binding) (string, time.Time, error) {
+	res, err := c.Exchange(subjectToken, b)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	return res.AccessToken, res.ExpiresAt, nil
 }
 
 // exchangeForIDJAG is step two: the caller's token becomes an ID-JAG assertion
