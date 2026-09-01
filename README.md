@@ -75,6 +75,23 @@ reality will trust none of it.
 
 # Part 2. For developers
 
+## Where to go next
+
+This README is the reference: what every setting does, and how to get the demo running.
+The documents below are the ones to read for a real deployment.
+
+| Document | Read it when |
+|---|---|
+| [docs/INTEGRATION.md](docs/INTEGRATION.md) | You are putting this into **your own** Bifrost. The adoption path in the order you will hit it, the decisions you have to make, and an incremental rollout rather than a big switch |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | You are reviewing or extending it. Why there are exactly two places the plugin can act, and why every other design decision follows from one constraint |
+| [SECURITY.md](SECURITY.md) | Before you let it near anything that matters. Threat model, the revocation gap stated precisely, and what this does **not** protect against |
+| [docs/PRODUCTION.md](docs/PRODUCTION.md) | You are past the demo. Every demo-only setting and what it should be instead, plus what is genuinely still missing |
+
+**Start with the constraint that decides whether you want this at all:** Bifrost's published
+images are statically linked and cannot load any Go plugin, so running one means building and
+maintaining your own Bifrost binary. That is a standing operational cost, not a one-off.
+[docs/INTEGRATION.md](docs/INTEGRATION.md) leads with it.
+
 ## What this plugin is for
 
 Bifrost is a capable MCP gateway. It terminates OAuth 2.1, supports dynamic client
