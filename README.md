@@ -50,10 +50,10 @@ So when you deactivate a misbehaving agent, two things are true at once. Okta wi
 it anything new, instantly. And the credential it is already holding keeps working until it
 expires on its own.
 
-Closing that gap needs something that **keeps asking**, on every single call rather than once
-per session. The only component that sees every call is the gateway. That is why this is a
-gateway plugin rather than a library, and why the per-call check is the reason the plugin
-exists rather than an optimisation on top of it.
+Closing that gap needs something that **keeps asking**, gating every call on a recent answer
+rather than checking once per session. The only component that sees every call is the gateway.
+That is why this is a gateway plugin rather than a library, and why the per-call check is the
+reason the plugin exists rather than an optimisation on top of it.
 
 ### What it does not do
 
