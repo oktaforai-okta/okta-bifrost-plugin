@@ -252,7 +252,7 @@ Per binding:
 | Key | Required | Notes |
 |---|---|---|
 | `authorization_server_id` | yes | The `aus...` custom authorization server protecting the target |
-| `target_resource_url` | yes | Sent as `resource`. This is what Okta stamps into the token's `aud` |
+| `target_resource_url` | yes | Sent as `resource` on the exchange. The issued token's `aud` is observed to equal this value, though what *determines* `aud` is [an open question](#open-question-what-determines-aud) |
 | `scopes` | yes | Requested on the minted token |
 | `tools` | no | Restricts which tools this binding serves. Empty means all. **Namespaced names**, see below |
 
@@ -417,7 +417,28 @@ another agent.
 | **Scopes are enforced on the managed CONNECTION** | Not only on the authorization server's policy. Publishing a scope on the server is **not enough** |
 | **Okta does not down-scope** | An ungrantable scope fails the **whole** request rather than returning the grantable subset |
 | **Agent JWK registration requires `use: "sig"`** | Otherwise it 400s with "Key 'use' must be 'sig'" |
-| **`aud` comes from `resource`** | Not from the authorization server's `audiences` field. Two servers can share an `audiences` value and issue tokens with entirely different `aud`. A resource server validating `aud` must check the resource URL |
+| **Validate `aud` against the resource URL** | Observed: the issued token's `aud` equals the `resource` value sent on the exchange. So a resource server should check the resource URL. Whether `resource` or the authorization server's own `audiences` setting is what *determines* `aud` is **not established**, see below |
+
+### Open question: what determines `aud`
+
+**Do not state that `aud` comes from the `resource` parameter.** It is not established, and it
+is easy to conclude wrongly from a working setup.
+
+What is observed: the issued token's `aud` equals the `resource` value sent on the exchange.
+
+Why that is not proof: in this demo both bindings share **one** authorization server. If that
+server's configured `audiences` holds the same string, then `resource` and `audiences` predict
+the **same** `aud`, and no observation here can tell them apart. A matching `aud` is consistent
+with `resource` being authoritative. It does not demonstrate it.
+
+Settling it needs one of two things:
+
+- read the authorization server's `audiences` value and confirm it **differs** from the
+  `resource` sent, then see which one `aud` follows; or
+- send a `resource` the server's `audiences` does **not** contain, and see which one wins.
+
+Until then, treat "validate against the resource URL" as the operational instruction, which is
+correct either way, and treat the mechanism as unknown.
 
 To change connection scopes over the API:
 
