@@ -3,6 +3,7 @@ package oktabifrost
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -64,6 +65,31 @@ type Config struct {
 	// false, and should stay false. It exists only so the failure mode is an explicit,
 	// auditable choice rather than an accident of implementation.
 	FailOpen bool `json:"fail_open,omitempty"`
+
+	// AllowConnectWithoutCaller lets a connection be established when the request
+	// carries no caller token, in which case NO upstream Authorization header is
+	// attached.
+	//
+	// This exists because of how Bifrost registers MCP clients. Registration, and the
+	// tool discovery that comes with it, happens at STARTUP, where there is no inbound
+	// HTTP request and therefore no caller token to delegate from. With this left false
+	// the connection is refused, registration fails, no tools are discovered, and every
+	// subsequent tool call fails with "tool not found" rather than with anything
+	// resembling an authorization error. The gateway is then unusable for reasons that
+	// look nothing like their cause.
+	//
+	// Turning it on does not weaken enforcement, and it is worth being precise about
+	// why. A connection established this way carries no credential, so the upstream
+	// server rejects any tool call over it. Independently, PreMCPHook still requires a
+	// caller token and a successful Okta mint before any tool executes, and that check
+	// is not affected by this setting. What this permits is exactly the unauthenticated
+	// handshake and tools/list that discovery needs, which is the same thing an MCP
+	// server that publishes its tool list already allows.
+	//
+	// It is nevertheless opt-in and defaults to false, because "connect without a
+	// credential" should be a deliberate, visible choice in configuration rather than
+	// something the plugin decides on a caller's behalf.
+	AllowConnectWithoutCaller bool `json:"allow_connect_without_caller,omitempty"`
 }
 
 // Binding ties one Bifrost MCP client to one Okta authorization server.
@@ -175,6 +201,35 @@ func (c *Config) bindingFor(clientName string) (Binding, error) {
 		return Binding{}, fmt.Errorf("no okta binding configured for mcp client %q", clientName)
 	}
 	return b, nil
+}
+
+// verdictKey identifies what a cached verdict was actually decided about.
+//
+// It is deliberately the whole question put to Okta, not just the authorization server.
+// Two bindings can share one authorization server and differ in target resource or in
+// requested scopes, and Okta's answer for one says nothing about the other. Keyed on the
+// authorization server alone, a cache can report "permitted" for a request it never
+// evaluated, which is the worst failure available to an authorization check: it does not
+// look like a failure. The demo tenant has exactly that shape, two lanes on one
+// authorization server separated only by scope.
+//
+// Scopes are sorted, so two bindings asking for the same set in a different order share
+// a verdict while any difference in the set does not. The binding's own slice is copied
+// rather than sorted in place, because it belongs to the caller's configuration and
+// reordering it here would be a side effect from something that reads like a getter.
+//
+// Fields are joined with NUL, which cannot appear in an Okta id, a URL, or an OAuth
+// scope token, so no combination of values can be concatenated into a collision.
+func (b Binding) verdictKey() string {
+	scopes := make([]string, len(b.Scopes))
+	copy(scopes, b.Scopes)
+	sort.Strings(scopes)
+
+	return strings.Join([]string{
+		b.AuthorizationServerID,
+		b.TargetResourceURL,
+		strings.Join(scopes, " "),
+	}, "\x00")
 }
 
 // permitsTool reports whether this binding may serve the named tool.

@@ -148,6 +148,211 @@ func TestDeniesWhenCallerPresentedNoToken(t *testing.T) {
 	mustDeny(t, sc, "no caller identity token")
 }
 
+// Two bindings sharing ONE authorization server must not share a cached verdict.
+//
+// This is the shape the demo tenant actually has: both lanes are served by the same
+// authorization server and are separated only by scope. Keyed on the authorization
+// server alone, the read lane's success answered for the command lane, so the cache
+// reported "permitted" for a request Okta had never been asked about. Connect-time
+// minting still refused, so the behaviour looked correct from outside, which is what
+// made this worth a test rather than an observation: correctness rested on a second
+// mechanism instead of on this one being right.
+func TestVerdictIsNotSharedAcrossBindingsOnOneAuthorizationServer(t *testing.T) {
+	const sharedAS = "aus-one-lane-for-both"
+
+	cfg := testConfig()
+	for _, name := range []string{readClient, cmdClient} {
+		b := cfg.Bindings[name]
+		b.AuthorizationServerID = sharedAS
+		cfg.Bindings[name] = b
+	}
+
+	// Okta refuses everything it is actually asked. The only "yes" available is the one
+	// seeded into the cache below, so if the command lane is permitted it can only be
+	// because it read the read lane's answer.
+	oktaSays := &OktaError{
+		StatusCode:  400,
+		Code:        "invalid_scope",
+		Description: "The following scopes are not allowed for this request: [fleet.dispatch.command].",
+	}
+	p := newTestPlugin(t, cfg, &fakeOkta{mintErr: oktaSays})
+
+	// A caller token has to be present, or a cache miss is refused for the missing
+	// subject before a mint is ever attempted, and the test would pass for the wrong
+	// reason.
+	ctx := ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"authorization": "Bearer caller.tok.en",
+	})
+
+	// The read lane was permitted a moment ago, well inside the TTL.
+	p.record(cfg.Bindings[readClient], nil)
+
+	// The command lane asks for a scope that was never granted. Its refusal must stand.
+	_, sc, err := p.PreMCPHook(ctx, toolCall(cmdClient, "dispatch_vehicle"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mustDeny(t, sc, "invalid_scope")
+
+	// And the converse: recording the command lane's refusal must not clobber the read
+	// lane's standing answer.
+	_, sc, err = p.PreMCPHook(ctx, toolCall(readClient, "read_telemetry"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sc != nil {
+		t.Fatalf("the read lane's own verdict was overwritten by another binding: %v",
+			sc.Error.Error.Message)
+	}
+}
+
+// The other direction, and the damaging one: a DENIAL on one binding must not refuse a
+// call on another binding that shares the authorization server.
+//
+// This is worse than the masking direction it mirrors. Masking makes a refusal permissive,
+// which connect-time minting still catches. This makes an ALLOWED call fail, and fail with
+// a message naming a scope that binding never requested, so it reads as though the plugin
+// is confused rather than as a cache artifact. It also makes behaviour order-dependent:
+// the same call succeeds or fails depending on what ran before it and how long ago.
+func TestDenialOnOneBindingDoesNotPoisonAnotherOnTheSameAuthorizationServer(t *testing.T) {
+	const sharedAS = "aus-one-lane-for-both"
+
+	cfg := testConfig()
+	for _, name := range []string{readClient, cmdClient} {
+		b := cfg.Bindings[name]
+		b.AuthorizationServerID = sharedAS
+		cfg.Bindings[name] = b
+	}
+
+	// Okta issues happily for anything it is actually asked. The only "no" in play is the
+	// one seeded into the cache below, so a refusal here can only have come from there.
+	p := newTestPlugin(t, cfg, &fakeOkta{})
+
+	ctx := ctxWith(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"authorization": "Bearer caller.tok.en",
+	})
+
+	// The command lane was refused a moment ago, well inside the TTL.
+	p.record(cfg.Bindings[cmdClient], &OktaError{
+		StatusCode:  400,
+		Code:        "invalid_scope",
+		Description: "The following scopes are not allowed for this request: [fleet.dispatch.command].",
+	})
+
+	// The read lane asks only for scopes it holds. It must not inherit that refusal.
+	for _, tool := range []string{"read_telemetry", "list_routes"} {
+		_, sc, err := p.PreMCPHook(ctx, toolCall(readClient, tool))
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", tool, err)
+		}
+		if sc != nil {
+			t.Fatalf("%s was refused by another binding's cached denial: %s",
+				tool, sc.Error.Error.Message)
+		}
+	}
+}
+
+// The key is the whole question, so scope ORDER must not matter while scope CONTENT must.
+// Without the sort, reordering a scope list in configuration would silently split one
+// verdict into two and double the calls to Okta; without the content sensitivity, two
+// genuinely different requests would share an answer.
+func TestVerdictKeyIgnoresScopeOrderButNotScopeContent(t *testing.T) {
+	base := Binding{
+		AuthorizationServerID: "aus1",
+		TargetResourceURL:     "https://example.test/tasking",
+		Scopes:                []string{"task.read", "agent.invoke"},
+	}
+
+	reordered := base
+	reordered.Scopes = []string{"agent.invoke", "task.read"}
+	if base.verdictKey() != reordered.verdictKey() {
+		t.Errorf("same scopes in a different order must share a verdict key")
+	}
+
+	// Reading the key must not reorder the caller's own configuration.
+	if base.Scopes[0] != "task.read" {
+		t.Errorf("verdictKey sorted the binding's slice in place, got %v", base.Scopes)
+	}
+
+	differentScopes := base
+	differentScopes.Scopes = []string{"task.read", "task.dispatch"}
+	if base.verdictKey() == differentScopes.verdictKey() {
+		t.Errorf("different scope sets must not share a verdict key")
+	}
+
+	differentResource := base
+	differentResource.TargetResourceURL = "https://example.test/intake"
+	if base.verdictKey() == differentResource.verdictKey() {
+		t.Errorf("different target resources must not share a verdict key")
+	}
+
+	differentAS := base
+	differentAS.AuthorizationServerID = "aus2"
+	if base.verdictKey() == differentAS.verdictKey() {
+		t.Errorf("different authorization servers must not share a verdict key")
+	}
+}
+
+// The invariant behind AllowConnectWithoutCaller, asserted as a pair because each half
+// is worthless without the other.
+//
+// Bifrost registers MCP clients, and discovers their tools, at startup, where there is
+// no inbound request and so no caller token. Denying that connect means no tools are
+// ever registered and every later call fails as "tool not found", which looks nothing
+// like an authorization problem. So a tokenless CONNECT must be permitted.
+//
+// It must also stay harmless, and that rests on two things this test pins: no
+// Authorization header is attached to the connection, and a tokenless EXECUTE is still
+// refused. If someone ever makes the connect deny again, or lets the execute through,
+// one half of this fails.
+func TestTokenlessConnectAllowedButExecuteDenied(t *testing.T) {
+	cfg := testConfig()
+	cfg.AllowConnectWithoutCaller = true
+	okta := &fakeOkta{}
+	p := newTestPlugin(t, cfg, okta)
+
+	// Connect, with no caller token anywhere on the context.
+	req, connSC, err := p.PreMCPConnectionHook(nil, &schemas.BifrostMCPConnectRequest{ClientName: readClient})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if connSC != nil {
+		t.Fatalf("tokenless connect must be permitted so discovery can run, got denial: %v",
+			connSC.Error.Error.Message)
+	}
+	if got, ok := req.Headers["Authorization"]; ok {
+		t.Fatalf("tokenless connect must attach no credential, got Authorization %q", got)
+	}
+	if okta.calls != 0 {
+		t.Fatalf("tokenless connect must not attempt a mint, got %d call(s)", okta.calls)
+	}
+
+	// Execute over that same tokenless connection is still refused.
+	_, callSC, err := p.PreMCPHook(nil, toolCall(readClient, "read_telemetry"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	mustDeny(t, callSC, "no caller identity token")
+}
+
+// The permission above is opt-in. Left at its default, a tokenless connect is refused,
+// so nothing changes for a deployment that never sets the flag.
+func TestTokenlessConnectDeniedByDefault(t *testing.T) {
+	p := newTestPlugin(t, testConfig(), &fakeOkta{})
+
+	_, sc, err := p.PreMCPConnectionHook(nil, &schemas.BifrostMCPConnectRequest{ClientName: readClient})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sc == nil {
+		t.Fatalf("expected a tokenless connect to be denied when the flag is unset")
+	}
+	if sc.Error == nil || sc.Error.Error == nil ||
+		!strings.Contains(sc.Error.Error.Message, "no caller identity token") {
+		t.Fatalf("denial did not name the missing caller token: %+v", sc.Error)
+	}
+}
+
 // Okta's own words must survive to the caller. "invalid_scope, the following scopes are
 // not allowed" is a permission refusal; "invalid_target" is a misconfiguration. Losing
 // that distinction makes a denial unreadable.

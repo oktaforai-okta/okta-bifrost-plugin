@@ -78,8 +78,10 @@ type Plugin struct {
 	cfg  Config
 	okta OktaClient
 
-	mu       sync.RWMutex
-	verdicts map[string]verdict // keyed by binding (authorization server id)
+	mu sync.RWMutex
+	// keyed by Binding.verdictKey, which is the whole question put to Okta rather than
+	// just the authorization server. See that method for why the difference matters.
+	verdicts map[string]verdict
 }
 
 // verdict caches the outcome of the most recent mint for a binding. Only the outcome
@@ -118,6 +120,29 @@ func (p *Plugin) Cleanup() error { return nil }
 //
 // Headers are mutable only on the connect request, which is why minting happens here
 // rather than per call. ConnectionString, StdioCommand and StdioArgs are left alone.
+//
+// WHY A CONNECT WITH NO CALLER TOKEN IS PERMITTED, when AllowConnectWithoutCaller is
+// set. Please read this before "fixing" it back into an unconditional deny.
+//
+// Bifrost registers MCP clients, and discovers their tools, at STARTUP. There is no
+// inbound HTTP request at that point, so there is no caller token to delegate from.
+// Denying that connect means no tools are ever registered, and every later tool call
+// fails with "tool not found" rather than with anything resembling an authorization
+// error. The gateway is then completely unusable for a reason that looks nothing like
+// its cause, and the only hint is an empty tools array.
+//
+// Permitting it does not make anything executable, for two independent reasons, both
+// covered by TestTokenlessConnectAllowedButExecuteDenied:
+//
+//  1. No Authorization header is attached, so the upstream server refuses any tool call
+//     over such a connection. It validates independently of this gateway.
+//  2. PreMCPHook still denies every execute, chat_tool_call and responses_tool_call
+//     without a caller token and a live Okta mint, and is unaffected by this setting.
+//     Discovery needs only initialize and tools/list, which that hook deliberately does
+//     not gate.
+//
+// That pairing, connect permitted while execute denied, is the invariant. Changing
+// either half without the other breaks it.
 func (p *Plugin) PreMCPConnectionHook(
 	ctx *schemas.BifrostContext,
 	req *schemas.BifrostMCPConnectRequest,
@@ -135,6 +160,16 @@ func (p *Plugin) PreMCPConnectionHook(
 
 	subject, err := subjectTokenFrom(ctx)
 	if err != nil {
+		// Bifrost registers MCP clients, and discovers their tools, at startup: there is
+		// no inbound request at that point and so no caller token. Refusing here means no
+		// tools are ever registered and every later call fails as "tool not found".
+		//
+		// Allowing it attaches no credential, so the upstream server refuses any tool
+		// call over this connection, and PreMCPHook still gates execution on a caller
+		// token and a live Okta mint regardless of this setting.
+		if p.cfg.AllowConnectWithoutCaller {
+			return req, nil, nil
+		}
 		return req, connectDenied(err.Error()), nil
 	}
 
@@ -237,7 +272,7 @@ func (p *Plugin) PostMCPHook(
 // connection re-established, which this hook cannot do.
 func (p *Plugin) stillPermitted(ctx *schemas.BifrostContext, b Binding) (bool, string, error) {
 	ttl := p.cfg.StatusTTL()
-	key := b.AuthorizationServerID
+	key := b.verdictKey()
 
 	p.mu.RLock()
 	cached, ok := p.verdicts[key]
@@ -269,7 +304,7 @@ func (p *Plugin) record(b Binding, mintErr error) {
 		v.reason = mintErr.Error()
 	}
 	p.mu.Lock()
-	p.verdicts[b.AuthorizationServerID] = v
+	p.verdicts[b.verdictKey()] = v
 	p.mu.Unlock()
 }
 
